@@ -5,7 +5,7 @@ from flask import Flask, request, jsonify, redirect
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
-import jwt # pip install pyjwt
+import jwt 
 
 app = Flask(__name__)
 CORS(app)
@@ -19,8 +19,18 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
+    phone = db.Column(db.String(10), nullable=True) 
+    address = db.Column(db.String(300), nullable=True) 
     password = db.Column(db.String(200), nullable=False)
-    role = db.Column(db.String(10), default='user') # 'user' or 'admin'
+    role = db.Column(db.String(10), default='user') 
+    orders = db.relationship('Order', backref='user', lazy=True)
+
+class Order(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    order_id = db.Column(db.String(20), unique=True)
+    total_price = db.Column(db.Float)
+    timestamp = db.Column(db.DateTime, default=datetime.datetime.utcnow)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
 
 class Product(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -36,10 +46,10 @@ class AttackLog(db.Model):
     payload = db.Column(db.String(500))
     endpoint = db.Column(db.String(100))
     timestamp = db.Column(db.DateTime, default=datetime.datetime.utcnow)
-    decision = db.Column(db.String(50)) # Blocked, Trapped
-    threat_level = db.Column(db.Integer, default=1) # 1-5 for dash visuals
+    decision = db.Column(db.String(50)) 
+    threat_level = db.Column(db.Integer, default=1)
 
-# --- NEW: PASSWORD VALIDATION HELPER ---
+# --- PASSWORD VALIDATION HELPER ---
 def is_strong_password(password):
     """Enforces: 8+ chars, 1 Uppercase, 1 Number, 1 Special Char"""
     if len(password) < 8: return False
@@ -62,16 +72,13 @@ def analyze_and_respond(req):
     ip = req.remote_addr
     path = req.path
     payload = str(req.args.to_dict()) + str(req.form.to_dict()) + str(req.data)
-    
     if path == '/admin-secret' or path == '/internal-db':
         log_attack(ip, "Honeypot Trap Trigger", path, "Trapped", 5)
         return "TRAP"
-
     for attack_name, (pattern, level) in ATTACK_PATTERNS.items():
         if re.search(pattern, payload, re.IGNORECASE) or re.search(pattern, path, re.IGNORECASE):
             log_attack(ip, attack_name, payload, "Trapped", level)
             return "TRAP" 
-            
     return "ALLOW"
 
 def log_attack(ip, type, payload, decision, level):
@@ -82,9 +89,8 @@ def log_attack(ip, type, payload, decision, level):
 # --- SECURITY MIDDLEWARE ---
 @app.before_request
 def security_filter():
-    if request.path in ['/api/login', '/api/register', '/fake-admin-panel']:
+    if request.path in ['/api/login', '/api/register', '/fake-admin-panel', '/api/user/update']:
         return
-
     if request.path.startswith('/api/') or request.path == '/admin-secret':
         result = analyze_and_respond(request)
         if result == "TRAP":
@@ -94,18 +100,16 @@ def security_filter():
 @app.route('/api/register', methods=['POST'])
 def register():
     data = request.json
-    if not data or not data.get('username') or not data.get('email') or not data.get('password'):
+    if not data or not data.get('phone') or not data.get('password'):
         return jsonify({"message": "All fields required"}), 400
-    
-    # MODIFIED: Check password strength
+    if not re.match(r"^[0-9]{10}$", str(data.get('phone', ''))):
+        return jsonify({"message": "Invalid Phone (10 digits required)"}), 400
     if not is_strong_password(data['password']):
         return jsonify({"message": "WEAK_PASSWORD_ERROR"}), 400
-
     if User.query.filter_by(email=data['email']).first():
         return jsonify({"message": "Email already exists"}), 409
-    
     hashed_pw = generate_password_hash(data['password'])
-    new_user = User(username=data['username'], email=data['email'], password=hashed_pw)
+    new_user = User(username=data['username'], email=data['email'], phone=data['phone'], address=data.get('address', 'Not Set'), password=hashed_pw)
     db.session.add(new_user)
     db.session.commit()
     return jsonify({"message": "Registration successful"}), 201
@@ -115,112 +119,76 @@ def login():
     data = request.json
     user = User.query.filter_by(email=data['email']).first()
     if user and check_password_hash(user.password, data['password']):
-        token = jwt.encode({
-            'user_id': user.id,
-            'role': user.role,
-            'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=1)
-        }, app.config['SECRET_KEY'], algorithm='HS256')
-        return jsonify({"token": token, "user": {"id": user.id, "username": user.username, "role": user.role}}), 200
+        if str(user.phone) != str(data.get('phone')): return jsonify({"message": "Phone number mismatch!"}), 401
+        token = jwt.encode({'user_id': user.id, 'role': user.role, 'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=24)}, app.config['SECRET_KEY'], algorithm='HS256')
+        return jsonify({"token": token, "user": {"id": user.id, "username": user.username, "role": user.role, "email": user.email, "phone": user.phone, "address": user.address}}), 200
     return jsonify({"message": "Invalid email or password"}), 401
 
-# --- UPDATED: PRODUCT API WITH SEARCH ---
+# --- FIXED: UPDATE ACCOUNT ROUTE ---
+@app.route('/api/user/update', methods=['POST'])
+def update_user():
+    data = request.json
+    user = User.query.get(data.get('id'))
+    if user:
+        user.username = data.get('username', user.username)
+        user.phone = data.get('phone', user.phone)
+        user.address = data.get('address', user.address)
+        db.session.commit()
+        # Return full user object to frontend so it doesn't lose state/logout
+        return jsonify({
+            "message": "Profile Updated", 
+            "user": {
+                "id": user.id, 
+                "username": user.username, 
+                "email": user.email, 
+                "phone": user.phone, 
+                "address": user.address, 
+                "role": user.role
+            }
+        }), 200
+    return jsonify({"message": "User not found"}), 404
+
+# --- USER PROFILE & ORDERS ---
+@app.route('/api/user/orders/<int:user_id>', methods=['GET'])
+def get_user_orders(user_id):
+    orders = Order.query.filter_by(user_id=user_id).all()
+    return jsonify([{"order_id": o.order_id, "total": o.total_price, "date": o.timestamp.strftime("%Y-%m-%d")} for o in orders])
+
+@app.route('/api/place-order', methods=['POST'])
+def place_order():
+    data = request.json
+    new_order = Order(order_id=data['order_id'], total_price=data['total'], user_id=data['user_id'])
+    db.session.add(new_order)
+    db.session.commit()
+    return jsonify({"message": "Order Saved"}), 201
+
+# --- PRODUCT & ADMIN API ---
 @app.route('/api/products', methods=['GET'])
 def get_products():
-    category = request.args.get('category')
-    search_query = request.args.get('q') 
-    
+    q, cat = request.args.get('q'), request.args.get('category')
     query = Product.query
-    if category:
-        query = query.filter_by(category=category)
-    if search_query:
-        query = query.filter(Product.name.ilike(f'%{search_query}%'))
-        
+    if cat: query = query.filter_by(category=cat)
+    if q: query = query.filter(Product.name.ilike(f'%{q}%'))
     products = query.all()
     return jsonify([{"id": p.id, "name": p.name, "category": p.category, "price": p.price, "img_url": p.img_url} for p in products])
 
-# --- UPDATED: ADMIN STATS (ACCESS TO MALICIOUS DATA) ---
 @app.route('/api/admin/dashboard-stats', methods=['GET'])
 def get_dashboard_stats():
     total_threats = AttackLog.query.count()
     total_trapped = AttackLog.query.filter_by(decision='Trapped').count()
-    total_users = User.query.count()
-    
-    # FETCH RECENT MALICIOUS ACTIVITY LOGS
     logs = AttackLog.query.order_by(AttackLog.timestamp.desc()).limit(5).all()
     recent_threats = [{"detection": l.attack_type, "threat_level": l.threat_level, "source_ip": l.ip, "timestamp": l.timestamp.strftime("%H:%M:%S")} for l in logs]
-    
     return jsonify({
-        "total_threats": total_threats, 
-        "total_defended": total_threats - total_trapped, 
-        "total_failed": total_trapped, 
-        "total_users": total_users,
+        "total_threats": total_threats, "total_defended": total_threats - total_trapped, 
+        "total_failed": total_trapped, "total_users": User.query.count(),
         "recent_threats": recent_threats,
-        "total_integrity": 7869, "critical_integrity": 2573, 
-        "suspicious_integrity": 2117, "stable_integrity": 3179
+        "total_integrity": 7869, "critical_integrity": 2573, "suspicious_integrity": 2117, "stable_integrity": 3179
     })
 
-# --- HONEYPOT ROUTES ---
-@app.route('/admin-secret', strict_slashes=False)
-def admin_secret_trap():
-    ip = request.remote_addr
-    log_attack(ip, "Honeypot Trap Trigger", "/admin-secret", "Trapped", 5)
-    return redirect('/fake-admin-panel')
-
+# --- DECEPTION UI ---
 @app.route('/fake-admin-panel', strict_slashes=False)
 def fake_admin():
-    return """
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <title>AEGIS // ADMIN_DASHBOARD_V4</title>
-        <script src="https://cdn.tailwindcss.com"></script>
-        <style>
-            body { background: #0b1120; color: white; font-family: 'Inter', sans-serif; }
-            .glass { background: rgba(255, 255, 255, 0.04); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.08); }
-            .matrix-glow { color: #10b981; text-shadow: 0 0 10px #10b981; }
-            .btn-fake { background: rgba(59, 130, 246, 0.1); border: 1px solid #3b82f6; transition: 0.3s; }
-            .btn-fake:hover { background: #3b82f6; color: white; }
-        </style>
-    </head>
-    <body class="p-8">
-        <header class="flex justify-between items-center mb-10">
-            <div>
-                <h1 class="text-3xl font-bold matrix-glow">AEGIS <span class="text-white">DASHBOARD</span></h1>
-                <p class="text-xs text-green-700 font-mono mt-1">SECURE_NODE: PRIMARY-DB-01 // SESSION: AUTH_BYPASS_DETECTED</p>
-            </div>
-            <div class="flex space-x-4">
-                <div class="glass px-4 py-2 rounded-lg text-xs font-mono text-gray-400">SERVER_TIME: 00:42:18</div>
-                <button onclick="alert('SYSTEM LOCKDOWN: Terminal Access Only')" class="bg-red-900/30 border border-red-600 text-red-500 px-4 py-2 rounded-lg text-sm font-bold">EMERGENCY SHUTDOWN</button>
-            </div>
-        </header>
-        <div class="grid grid-cols-4 gap-6 mb-8">
-            <div class="glass p-6 rounded-3xl border-l-4 border-blue-500"><p class="text-gray-500 text-sm">Total Sales</p><p class="text-3xl font-bold mt-1">₹8,42,190.00</p></div>
-            <div class="glass p-6 rounded-3xl border-l-4 border-green-500"><p class="text-gray-500 text-sm">Active Sessions</p><p class="text-3xl font-bold mt-1">1,042</p></div>
-            <div class="glass p-6 rounded-3xl border-l-4 border-purple-500"><p class="text-gray-500 text-sm">Database Load</p><p class="text-3xl font-bold mt-1">12%</p></div>
-            <div class="glass p-6 rounded-3xl border-l-4 border-yellow-500"><p class="text-gray-500 text-sm">Pending Shipments</p><p class="text-3xl font-bold mt-1">84</p></div>
-        </div>
-        <div class="grid grid-cols-3 gap-6">
-            <div class="glass p-8 rounded-3xl space-y-6">
-                <h3 class="text-xl font-semibold border-b border-gray-800 pb-4">User Access Control</h3>
-                <div class="space-y-4">
-                    <div class="flex justify-between items-center bg-gray-900/50 p-3 rounded-xl border border-gray-800"><span class="text-sm font-mono text-blue-400">admin_root</span><button onclick="alert('Action Logged')" class="text-xs text-gray-500 underline">View Hash</button></div>
-                    <div class="flex justify-between items-center bg-gray-900/50 p-3 rounded-xl border border-gray-800"><span class="text-sm font-mono text-blue-400">finance_lead</span><button onclick="alert('Action Logged')" class="text-xs text-gray-500 underline">View Hash</button></div>
-                </div>
-                <button onclick="alert('ERROR: Quarantine Buffer Full')" class="w-full btn-fake py-3 rounded-xl font-bold text-blue-400">DOWNLOAD USER_DB.SQL</button>
-            </div>
-            <div class="lg:col-span-2 glass p-8 rounded-3xl">
-                <h3 class="text-xl font-semibold mb-6">Internal System Logs</h3>
-                <div class="space-y-3 font-mono text-xs text-gray-500">
-                    <p class="text-green-500">[00:41:02] Connection established from IP: """ + request.remote_addr + """</p>
-                    <p>[00:41:08] Escalating privileges to ROOT... SUCCESS</p>
-                    <p class="animate-pulse text-red-500 font-bold">[!] ERROR: BACKDOOR DETECTED. COMMENCING DATA QUARANTINE...</p>
-                </div>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
+    return """<body style='background:#000;color:#0f0;padding:50px;font-family:monospace;'><h1>DECEPTION ACTIVE</h1><p>IP Traced: """ + request.remote_addr + """</p></body>"""
 
 @app.route('/elevate-demo-admin')
 def elevate_admin():
@@ -229,24 +197,16 @@ def elevate_admin():
         user.role = 'admin'
         db.session.commit()
         return f"User {user.username} is now ADMIN."
-    return "Register a user first."
+    return "Register first."
 
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
         if not Product.query.first():
-            items_map = {
-                "Clothes": ["Cotton T-Shirt", "Denim Jacket", "Formal Trouser", "Hooded Sweatshirt", "Summer Dress"],
-                "Electronics": ["Smartphone", "Wireless Earbuds", "Gaming Mouse", "Mechanical Keyboard", "Smart Watch"],
-                "Jewellery": ["Silver Ring", "Gold Pendant", "Crystal Earrings", "Luxury Watch", "Pearl Necklace"],
-                "Toys": ["Building Blocks", "Remote Control Car", "Action Figure", "Teddy Bear", "Puzzle Set"]
-            }
-            all_items = []
+            items_map = {"Jewellery": ["Gold Ring"], "Toys": ["Drone"], "Clothes": ["Hoodie"], "Electronics": ["Phone"]}
             for category, names in items_map.items():
                 for name in names:
-                    search_query = f"{name} product shot white background isolated".replace(' ', ',')
-                    img_url = f"https://images.unsplash.com/photo-1?auto=format&fit=crop&w=500&q=80&sig={random.randint(1, 5000)}&{search_query}"
-                    all_items.append(Product(name=f"Aegis {name}", category=category, price=round(random.uniform(499, 45000), 2), img_url=img_url))
-            db.session.add_all(all_items)
+                    img_url = f"https://loremflickr.com/320/240/{name.replace(' ', '')}?random={random.randint(1,5000)}"
+                    db.session.add(Product(name=f"Aegis {name}", category=category, price=5000, img_url=img_url))
             db.session.commit()
     app.run(debug=True, port=5000)
